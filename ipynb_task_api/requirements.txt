@@ -1,0 +1,14 @@
+fastapi>=0.110
+uvicorn[standard]
+pyodbc
+pika
+python-dotenv
+papermill
+nbformat
+nbclient
+pydantic>=2.11
+pydantic-settings>=2.2
+aiolimiter>=1.1
+pandas
+ipykernel
+openpyxl
