@@ -107,28 +107,47 @@ export default function MonitorExecutions() {
   }
 
   const handleDownload = async (execution: Execution) => {
-    if (!isDownloadAvailable(execution)) return
+    if (!isDownloadAvailable(execution)) return;
+  
     try {
-      const blob = await downloadFile(execution.requestId)
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = execution.outputPath ?? `output.${execution.outputType ?? "bin"}`
-      a.click()
-      URL.revokeObjectURL(url)
+      const response = await downloadFile(execution.requestId)
+      if (!response.ok) throw new Error("Falha no download");
+  
+      const blob = await response.blob();
+  
+      // Lê o header (case-insensitive) já que exposto pelo CORS
+      const disposition = response.headers.get("Content-Disposition") 
+                       || response.headers.get("content-disposition");
+      let filename = `output.${execution.outputType ?? "bin"}`;
+  
+      if (disposition) {
+        // Extrai tudo após filename= e remove aspas
+        const parts = disposition.split("filename=");
+        if (parts.length > 1) {
+          filename = parts[1].trim().replace(/['"]/g, "");
+        }
+      }
+  
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+  
       toast({
         title: "Download iniciado",
         description: `Baixando arquivo da execução ${execution.requestId}`,
-      })
+      });
     } catch (err) {
       toast({
         variant: "destructive",
         title: "Erro ao baixar arquivo",
         description: String(err),
-      })
+      });
     }
-  }
-
+  };
+  
   const handleShowDetails = (execution: Execution) => {
     setSelectedExecution(execution)
     setIsDrawerOpen(true)

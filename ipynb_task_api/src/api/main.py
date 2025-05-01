@@ -137,6 +137,7 @@ app.add_middleware(
     allow_credentials=True,          # se envia cookies/headers auth
     allow_methods=["*"],             # GET, POST, PUT, DELETE, …
     allow_headers=["*"],             # Content-Type, Authorization, …
+    expose_headers=["Content-Disposition"],
 )
 
 
@@ -209,23 +210,42 @@ async def result(
     repo: RequestRepository = Depends(get_repo),
 ):
     rec = repo.fetch_task(request_id)
+
     if not rec:
         raise HTTPException(404, "Request não encontrado")
     if rec.status != "SUCCESS":
         raise HTTPException(409, "Tarefa ainda não concluída")
+
     path = pathlib.Path(rec.output_path)
     if not path.exists():
         raise HTTPException(500, "Arquivo não encontrado")
+
     otype = OutputType(rec.output_type)
+    finished_at = (
+        rec.finished_at.strftime("%Y%m%d_%H%M%S")
+        if rec.finished_at else datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    )
+    filename_base = f"{rec.notebook_name}_{finished_at}"
+
     if otype is OutputType.JSON:
-        with path.open(encoding="utf-8") as fp:
-            return JSONResponse(json.load(fp))
+        return FileResponse(
+            str(path),
+            media_type="application/json",
+            filename=f"{filename_base}.json"
+        )
+
     media = (
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         if otype is OutputType.EXCEL
         else "application/xml"
     )
-    return FileResponse(str(path), media_type=media, filename=path.name)
+    extension = ".xlsx" if otype is OutputType.EXCEL else ".xml"
+
+    return FileResponse(
+        str(path),
+        media_type=media,
+        filename=f"{filename_base}{extension}"
+    )
 
 
 # -------------------- NOTEBOOK CRUD -----------------------

@@ -6,6 +6,8 @@ import papermill as pm
 from nbclient.exceptions import CellExecutionError
 
 from infrastructure.persistence.notebook_repository import NotebookRepository
+from infrastructure.persistence.logexecutor_repository import LogsExecutorRepository
+
 from utils.logger import get_logger
 from config.settings import settings
 
@@ -40,6 +42,7 @@ class NotebookRunner:
         self._timeout = timeout or settings.notebook_timeout
         self._kernel_name = kernel_name or "python3"
         self._repo = NotebookRepository()
+        self._logsExecutor = LogsExecutorRepository()
 
     # ------------------------------------------------------------------
 
@@ -52,6 +55,7 @@ class NotebookRunner:
     ) -> Tuple[OutputType, Path]:
         rows = self._repo.fetch(nb_name)
         if not rows:
+            self._logsExecutor.insert_log(f"[INFO] Notebook '{nb_name}' não cadastrado", request_id=request_id)
             raise NotebookRunError(f"Notebook '{nb_name}' não cadastrado")
 
         row = rows.get(version) if version else rows[max(rows, key=lambda v: int(v))]
@@ -64,6 +68,7 @@ class NotebookRunner:
         target = out_dir / f"{request_id}{row.output_ext}"
         injected = {**params, "output_filename": str(target)}
 
+        self._logsExecutor.insert_log(f"[INFO] Executando Notebook: '{nb_name}' ", request_id=request_id)
         logger.info("Executando %s v%s", nb_name, row.version)
         start = time.perf_counter()
         try:
@@ -75,11 +80,14 @@ class NotebookRunner:
                 kernel_name=self._kernel_name,
             )
         except CellExecutionError as exc:
+            self._logsExecutor.insert_log(f"[ERROR] {str(exc)}", request_id=request_id)
             raise NotebookRunError(str(exc)) from exc
         finally:
+            self._logsExecutor.insert_log(f"[INFO] Notebook '{nb_name}' finalizado em {time.perf_counter() - start:.1f} segundos", request_id=request_id)
             logger.info("Notebook %s finalizado em %.1f s", nb_name, time.perf_counter() - start)
 
         if not target.exists():
+            self._logsExecutor.insert_log(f"[ERROR] Arquivo de saída não foi gerado", request_id=request_id)
             raise NotebookRunError("Arquivo de saída não foi gerado")
 
         return OutputType.from_extension(target.suffix), target

@@ -75,8 +75,8 @@ export async function fetchExecutions(
 }
 
 /** Download genérico – ajusta rota se existir algo como /tasks/{id}/download */
-export async function downloadFile(requestId: string): Promise<Blob> {
-  const res = await fetch(`${API_BASE}/tasks/${requestId}/download`)
+export async function downloadFile(requestId: string): Promise<Response> {
+  const res = await fetch(`${API_BASE}/result/${requestId}`)
   if (!res.ok) throw new Error("Falha no download")
-  return res.blob()
+  return res
 }

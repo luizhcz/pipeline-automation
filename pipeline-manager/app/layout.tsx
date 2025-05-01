@@ -21,9 +21,14 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="pt-BR">
-      <body className={inter.className} suppressHydrationWarning={true}>
-        <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+    <html lang="pt-BR" suppressHydrationWarning>
+      <body suppressHydrationWarning className={inter.className}>
+        <ThemeProvider
+          attribute="class" // aplica a classe `dark` ou `light` no body
+          defaultTheme="dark"
+          enableSystem
+          disableTransitionOnChange
+        >
           <Providers>
             <div className="flex h-screen">
               <Sidebar />

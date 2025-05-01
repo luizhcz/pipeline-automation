@@ -56,14 +56,14 @@ export default function ExecutionDetailsDrawer({ execution, open, onClose }: Exe
             </div>
             <div>
               <p className="text-sm font-medium text-muted-foreground">Tentativas</p>
-              <p>{execution.retryCount}</p>
+              <p>{execution.retryCount + 1}</p>
             </div>
           </div>
 
           <div className="mb-4">
             <p className="text-sm font-medium text-muted-foreground mb-2">Parâmetros</p>
             <div className="bg-muted rounded-md p-3">
-              <pre className="text-xs whitespace-pre-wrap">{JSON.stringify(execution.params, null, 2)}</pre>
+              <pre className="text-xs whitespace-pre-wrap">{JSON.stringify(JSON.parse(execution.params), null, 2)}</pre>
             </div>
           </div>
 
@@ -82,19 +82,11 @@ export default function ExecutionDetailsDrawer({ execution, open, onClose }: Exe
               <div className="p-3 font-mono">
               {execution.logs.map((log, idx) => (
                 <div key={idx} className="flex space-x-2 text-sm">
-                  <span
-                    className={
-                      log.mensagem.includes("[ERROR]")
-                        ? "text-red-600"
-                        : log.mensagem.includes("[WARNING]")
-                        ? "text-yellow-600"
-                        : ""
-                    }
-                  >
-                    {log.mensagem}
-                  </span>
                   <span className="text-muted-foreground">
-                    — {formatDate(new Date(log.data))}
+                    [{formatDate(new Date(log.data), true)}]
+                  </span>
+                  <span>
+                    {log.mensagem}
                   </span>
                 </div>
               ))}
