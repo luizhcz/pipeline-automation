@@ -1,6 +1,5 @@
 # pipeline-automation
 
-```markdown
 # 🧪 Pipeline Manager
 
 Este projeto permite criar, executar e monitorar pipelines baseados em Jupyter Notebooks, com geração automática de arquivos (JSON, XML, XLSX etc).
