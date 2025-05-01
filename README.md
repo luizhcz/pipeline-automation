@@ -16,19 +16,32 @@ Este projeto permite criar, executar e monitorar pipelines baseados em Jupyter N
 ### 📦 Frontend
 
 ```bash
-cd frontend
+cd pipeline-automation\pipeline-manager
 npm install
 npm run dev
 ```
 
-### ⚙️ Backend
+### ⚙️ Backend - API
 
 ```bash
-cd backend
+cd pipeline-automation\ipynb_task_api\src
 python -m venv .venv
 source .venv/bin/activate  # no Windows use `.venv\Scripts\activate`
 pip install -r requirements.txt
-uvicorn src.main:app --reload
+```
+
+```bash
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### ⚙️ Backend - Worker
+
+```bash
+cd pipeline-automation\ipynb_task_api\src
+```
+
+```bash
+python -m worker.task_worker
 ```
 
 > ⚠️ Certifique-se de que o RabbitMQ esteja rodando localmente (`localhost:5672`) antes de iniciar o backend.
