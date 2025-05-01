@@ -60,14 +60,12 @@ class TaskWorker:
         runner: NotebookRunner | None = None,
         max_retries: int | None = None,
     ):
-        # Broker de consumo (sem confirm_delivery)
         self._broker = broker or ConsumerRabbitMQBroker()
-        # Broker de publicação (confirm_delivery=True) – para re-enqueue / DLQ
         self._publisher = PublisherRabbitMQBroker()
 
         self._repo = repo or SqlServerRequestRepository()
         self._runner = runner or NotebookRunner()
-        self._max_retries = 2 #max_retries or settings.max_retries or 2
+        self._max_retries = 2 
 
     # ------------------------------------------------------------------
 

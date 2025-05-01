@@ -1,38 +1,20 @@
-from contextlib import contextmanager
-from enum import Enum
+import pika
 import json
 import time
-from typing import Any, Callable, Dict, Optional, Protocol
 
-import pika
-from pydantic import Field
-from pydantic_settings import BaseSettings
+from typing import Any, Callable, Dict, Optional, Protocol
+from enum import Enum
+from pathlib import Path
+
+from config.settings import settings
 
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-
-class _Settings(BaseSettings):
-    rabbitmq_url: str = Field(..., env="RABBITMQ_URL")
-    task_queue: str   = Field("ipynb_tasks",      env="TASK_QUEUE")
-    dlq_queue: str    = Field("ipynb_tasks_dlq",  env="DLQ_QUEUE")
-
-    class Config:
-        env_file = ".env"
-
-_settings = _Settings()
-
-
 class QueueName(str, Enum):
-    TASK = _settings.task_queue
-    DLQ  = _settings.dlq_queue
-
-
-# ---------------------------------------------------------------------------
-# Conexão genérica -----------------------------------------------------------
-# ---------------------------------------------------------------------------
+    TASK = settings.task_queue
+    DLQ  = settings.dlq_queue
 
 class _Connection:
     """Wrapper de connection-with-reconnect.
@@ -80,11 +62,6 @@ class _Connection:
     def __exit__(self, *_):
         self.close()
 
-
-# ---------------------------------------------------------------------------
-# Interface (protocol) -------------------------------------------------------
-# ---------------------------------------------------------------------------
-
 class MessageBroker(Protocol):
     def publish(self, message: Dict[str, Any], queue: QueueName = QueueName.TASK) -> None: ...
     def consume(
@@ -93,17 +70,12 @@ class MessageBroker(Protocol):
         queue: QueueName = QueueName.TASK,
     ) -> None: ...
 
-
-# ---------------------------------------------------------------------------
-# Publisher Broker -----------------------------------------------------------
-# ---------------------------------------------------------------------------
-
 class PublisherRabbitMQBroker(MessageBroker):
     """Broker usado pela API (producer) e, ocasionalmente, pelo worker para reenfileirar."""
 
     def __init__(self, conn: _Connection | None = None):
         # confirm_delivery=True garante *publisher confirms*
-        self._conn = conn or _Connection(_settings.rabbitmq_url, confirm=True)
+        self._conn = conn or _Connection(settings.rabbitmq_url, confirm=True)
 
     # ------------- publish --------------------
 
@@ -122,17 +94,12 @@ class PublisherRabbitMQBroker(MessageBroker):
     def consume(self, *_, **__):  # noqa: D401
         raise NotImplementedError("Use ConsumerRabbitMQBroker para consumir.")
 
-
-# ---------------------------------------------------------------------------
-# Consumer Broker -----------------------------------------------------------
-# ---------------------------------------------------------------------------
-
 class ConsumerRabbitMQBroker(MessageBroker):
     """Broker exclusivo do Worker para *consumir*."""
 
     def __init__(self, conn: _Connection | None = None):
         # confirm_delivery=False → evita fechar canal em nack
-        self._conn = conn or _Connection(_settings.rabbitmq_url, confirm=False)
+        self._conn = conn or _Connection(settings.rabbitmq_url, confirm=False)
 
     # ---------- publish (re-uso interno) ------
     def publish(self, message: Dict[str, Any], queue: QueueName = QueueName.TASK) -> None:
@@ -173,11 +140,6 @@ class ConsumerRabbitMQBroker(MessageBroker):
             logger.info("Consumer interrompido (Ctrl+C)")
             ch.stop_consuming()
             self._conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Alias de compatibilidade ---------------------------------------------------
-# ---------------------------------------------------------------------------
 
 class RabbitMQBroker(PublisherRabbitMQBroker):
     """Alias mantido apenas para evitar alterações em pontos que importam
