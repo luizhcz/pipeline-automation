@@ -78,5 +78,12 @@ ALTER TABLE [dbo].[Tasks] ADD  DEFAULT ((0)) FOR [RetryCount]
 
 ALTER TABLE [dbo].[Tasks] ADD  DEFAULT (getdate()) FOR [CreatedAt]
 
+-- Execute no SQL Server Management Studio (SSMS)
+CREATE LOGIN pipeline_user WITH PASSWORD = 'SenhaSegura123!';
+CREATE USER pipeline_user FOR LOGIN pipeline_user;
+-- conceda permissões adequadas, por exemplo:
+ALTER ROLE db_datareader ADD MEMBER pipeline_user;
+ALTER ROLE db_datawriter ADD MEMBER pipeline_user;
+
 
 END

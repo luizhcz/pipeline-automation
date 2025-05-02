@@ -57,44 +57,7 @@ class RequestRepository: ...
 
 class SqlServerRequestRepository(RequestRepository):
     TABLE = "Tasks"
-    _DDL = f"""
-    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{TABLE}' AND xtype='U')
-    BEGIN
-        CREATE TABLE {TABLE} (
-            RequestId UNIQUEIDENTIFIER PRIMARY KEY,
-            NotebookName NVARCHAR(200),
-            Version NVARCHAR(10) NULL,
-            Params NVARCHAR(MAX),
-            Status NVARCHAR(30),
-            RetryCount INT DEFAULT 0,
-            CreatedAt DATETIME DEFAULT GETDATE(),
-            StartedAt DATETIME NULL,
-            FinishedAt DATETIME NULL,
-            OutputType NVARCHAR(10) NULL,
-            OutputPath NVARCHAR(4000) NULL,
-            Error NVARCHAR(MAX) NULL
-        );
-    END;
-
-
-    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Notebook' AND xtype='U')
-    BEGIN
-        CREATE TABLE Notebook (
-            NotebookName NVARCHAR(200) NOT NULL,
-            Version      NVARCHAR(10)  NOT NULL,
-            FilePath     NVARCHAR(4000) NOT NULL,
-            RequiredParams NVARCHAR(MAX) NOT NULL,    -- JSON: ["year", "branch"]
-            OutputExt    NVARCHAR(10)  NOT NULL,      -- ".json" | ".xml" | ".xlsx"
-            CONSTRAINT PK_Notebook PRIMARY KEY (NotebookName, Version)
-        );
-    END;
-    """
-
-    def __init__(self, ensure_schema: bool = True) -> None:
-        if ensure_schema:
-            with _connection() as conn:
-                conn.cursor().execute(self._DDL)
-
+    
     # ------------- helpers -----------------------
 
     @staticmethod

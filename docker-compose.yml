@@ -1,0 +1,33 @@
+services:
+  backend:
+    build: ./ipynb_task_api
+    container_name: backend-api
+    working_dir: /app/src
+    volumes:
+      - ./ipynb_task_api:/app
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - ./ipynb_task_api/.env.dev
+    environment:
+      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - CELERY_RESULT_BACKEND=rpc://
+    command: >
+      uvicorn api.main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+
+  worker:
+    build:
+      context: ./ipynb_task_api
+    container_name: worker
+    working_dir: /app/src
+    volumes:
+      - ./ipynb_task_api:/app
+    environment:
+      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - CELERY_RESULT_BACKEND=rpc://
+    command: python -m worker.task_worker
