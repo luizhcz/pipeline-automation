@@ -27,7 +27,6 @@ from infrastructure.persistence.logexecutor_repository import LogsExecutorReposi
 from infrastructure.persistence.tasks_repository import TaskRepository
 from services.validation.notebook_validator import NotebookValidator
 from utils.logger import get_logger
-from utils.ratelimiter import RateLimitMiddleware
 
 logger = get_logger(__name__)
 
@@ -108,7 +107,6 @@ def get_pipeline_repo():
 
 def get_broker() -> RabbitMQBroker:
     return RabbitMQBroker()
-
 
 def get_validator() -> NotebookValidator:
     return NotebookValidator()
