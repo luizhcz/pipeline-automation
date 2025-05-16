@@ -1,252 +1,169 @@
-"""
-infrastructure/broker/rabbitmq.py
-=================================
-
-Wrapper de alto nível para RabbitMQ usando Pika **1.3.2**.
-
-Principais características
---------------------------
-* Conexão única, thread-safe, com reconexão exponencial
-* Canais separados para publisher e consumer
-* Publisher Confirms reais (`confirm_delivery()` + `wait_for_confirms()`)
-* Fila principal + DLQ declaradas uma única vez
-* Prefetch configurável
-* Tratamento de JSON inválido e logging com stack-trace
-"""
-
-from __future__ import annotations
-
+import asyncio
 import json
-import threading
-import time
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, Protocol
-from urllib.parse import urlparse
+from typing import Any, Awaitable, Callable, Dict
 
-import pika
-from pika import exceptions as pk_exc
-
+import aio_pika
+from aio_pika import exceptions as aio_exc
 from config.settings import settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-# --------------------------------------------------------------------------- #
-# 1 ▪ Enum com os nomes das filas                                             #
-# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------- #
+# 1 ▪ Enum com os nomes das filas                                       #
+# --------------------------------------------------------------------- #
 class QueueName(str, Enum):
-    TASK = settings.task_queue
-    DLQ = settings.dlq_queue
+    TASK: str = settings.task_queue
+    DLQ:  str = settings.dlq_queue
 
 
-# --------------------------------------------------------------------------- #
-# 2 ▪ Conexão persistente e thread-safe                                       #
-# --------------------------------------------------------------------------- #
-class _Connection:
-    """Mantém uma única BlockingConnection viva e segura para múltiplas threads."""
+# --------------------------------------------------------------------- #
+# 2 ▪ Conexão e canais                                                  #
+# --------------------------------------------------------------------- #
+class _AsyncConnection:
+    """Mantém uma única RobustConnection viva para toda a aplicação."""
 
-    def __init__(self, url: str, heartbeat: int = 60, blocked_timeout: int = 30):
-        self._params = pika.URLParameters(url)
-        self._params.heartbeat = heartbeat
-        self._params.blocked_connection_timeout = blocked_timeout
+    def __init__(self, url: str, heartbeat: int = 60) -> None:
+        self._url        = url
+        self._heartbeat  = heartbeat
+        self._conn: aio_pika.RobustConnection | None = None
+        self._pub_ch: aio_pika.RobustChannel  | None = None
+        self._lock       = asyncio.Lock()
 
-        self._conn: Optional[pika.BlockingConnection] = None
-        self._lock = threading.Lock()
-
-    # ------------- helpers -------------------------------------------------- #
-    def _connect(self) -> pika.BlockingConnection:
-        delay = 1
-        parsed = urlparse(self._params.host)
-        logger.info("RabbitMQ → conectando em %s:%s…", parsed.hostname, self._params.port)
-
+    # ---------- helpers ------------------------------------------------- #
+    async def _new_conn(self) -> aio_pika.RobustConnection:
         while True:
             try:
-                conn = pika.BlockingConnection(self._params)
+                logger.info("RabbitMQ → conectando (async)…")
+                conn = await aio_pika.connect_robust(
+                    self._url,
+                    heartbeat=self._heartbeat,
+                    # reconexão exponencial automática
+                )
                 logger.info("RabbitMQ conectado ✔")
                 return conn
-            except pk_exc.AMQPConnectionError as err:
-                logger.warning("Falha na conexão (%s); tentando novamente em %ss…", err, delay)
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
+            except aio_exc.AMQPConnectionError as err:
+                logger.warning("Falha na conexão (%s) – tentando novamente…", err)
+                await asyncio.sleep(2)   # back-off fixo; `connect_robust` já usa exponencial
 
-    @property
-    def conn(self) -> pika.BlockingConnection:
-        with self._lock:
+    async def conn(self) -> aio_pika.RobustConnection:
+        async with self._lock:
             if not self._conn or self._conn.is_closed:
-                self._conn = self._connect()
-            return self._conn
+                self._conn = await self._new_conn()
+        return self._conn
 
-    # ------------- canal ---------------------------------------------------- #
-    def open_channel(
-        self,
-        confirms: bool = False,
-    ) -> pika.adapters.blocking_connection.BlockingChannel:
-        """
-        Abre *novo* canal (não compartilha entre threads).
+    # ---------- canal publisher ----------------------------------------- #
+    async def pub_channel(self) -> aio_pika.RobustChannel:
+        if self._pub_ch and not self._pub_ch.is_closed:
+            return self._pub_ch
 
-        Se ``confirms=True``, ativa publisher confirms usando a API do Pika 1.3.2:
-        * ``channel.confirm_delivery()``
-        * ``channel.wait_for_confirms()``
-        """
-        ch = self.conn.channel()
-
-        if confirms:
-            ch.confirm_delivery()
-            ch._supports_wait = True  # flag interna para publish()
-
+        ch = await (await self.conn()).channel(publisher_confirms=True)
+        await ch.set_qos(prefetch_count=0)   # publisher não prefetch
+        self._pub_ch = ch
         return ch
 
-    # ------------- encerramento -------------------------------------------- #
-    def close(self) -> None:
-        with self._lock:
-            if self._conn and not self._conn.is_closed:
-                self._conn.close()
+    # ---------- canal consumer ------------------------------------------ #
+    async def new_consumer_channel(self, prefetch: int) -> aio_pika.RobustChannel:
+        ch = await (await self.conn()).channel()
+        await ch.set_qos(prefetch_count=prefetch)
+        return ch
+
+    async def close(self) -> None:
+        if self._conn and not self._conn.is_closed:
+            await self._conn.close()
 
 
-# --------------------------------------------------------------------------- #
-# 3 ▪ Interface de broker                                                     #
-# --------------------------------------------------------------------------- #
-class MessageBroker(Protocol):
-    def publish(self, message: Dict[str, Any], queue: QueueName = QueueName.TASK) -> None: ...
-    def consume(
-        self,
-        callback: Callable[[Dict[str, Any]], bool],
-        queue: QueueName = QueueName.TASK,
-    ) -> None: ...
+# --------------------------------------------------------------------- #
+# 3 ▪ Publisher                                                         #
+# --------------------------------------------------------------------- #
+class AsyncPublisher:
+    def __init__(self, conn: _AsyncConnection | None = None):
+        self._conn = conn or _AsyncConnection(settings.rabbitmq_url)
 
+    async def _declare_queues(self) -> None:
+        ch = await self._conn.pub_channel()
+        # DLQ
+        await ch.declare_queue(
+            QueueName.DLQ.value, durable=True,
+            arguments={"x-dead-letter-exchange": ""},
+        )
+        # Fila principal
+        await ch.declare_queue(
+            QueueName.TASK.value, durable=True,
+            arguments={"x-dead-letter-exchange": ""},
+        )
 
-# --------------------------------------------------------------------------- #
-# 4 ▪ Publisher (API / re-enqueue)                                            #
-# --------------------------------------------------------------------------- #
-class PublisherRabbitMQBroker(MessageBroker):
-    """Broker usado pela API para publicar mensagens (e pelo worker para reenfileirar)."""
+    async def publish(self, message: Dict[str, Any],
+                      queue: QueueName = QueueName.TASK) -> None:
+        await self._declare_queues()              # executado só na 1ª vez
+        ch   = await self._conn.pub_channel()
+        body = aio_pika.Message(
+            body=json.dumps(message).encode(),
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+        )
 
-    def __init__(self, conn: _Connection | None = None):
-        self._conn = conn or _Connection(settings.rabbitmq_url)
-        self._channel = self._conn.open_channel(confirms=True)
-        self._declare_queues()
-
-    def _declare_queues(self) -> None:
-        """
-        Declara fila principal e DLQ.  
-        Se a fila já existir, faz `queue_declare(passive=True)` para
-        evitar erro de inequivalent arg.
-        """
-        # 1. DLQ sempre pode ser declarada (ou reusada idempotentemente).
-        self._channel.queue_declare(queue=QueueName.DLQ.value, durable=True)
-
-        # 2. Verifica se a fila principal existe
         try:
-            self._channel.queue_declare(queue=QueueName.TASK.value, passive=True)
-            logger.info("Fila %s já existe – mantendo configuração atual.", QueueName.TASK.value)
-        except pk_exc.ChannelClosedByBroker as err:
-            if err.reply_code == 404:            # não existe → criar com DLX
-                self._channel = self._conn.open_channel(confirms=True)  # canal novo
-                args = {"x-dead-letter-exchange": ""}
-                self._channel.queue_declare(
-                    queue=QueueName.TASK.value,
-                    durable=True,
-                    arguments=args,
-                )
-                logger.info("Fila %s criada com DLX.", QueueName.TASK.value)
-            else:
-                raise  # outros erros continuam sendo propagados
+            await ch.default_exchange.publish(
+                body, routing_key=queue.value, mandatory=True
+            )
+            logger.debug("Mensagem publicada em %s", queue.value)
+        except aio_exc.UnroutableError:
+            logger.error("Mensagem não roteada – descartada")
+        except aio_exc.AMQPError:
+            logger.exception("Erro no publish – canal será recriado")
+            # canal será recriado na próxima chamada
 
 
-    # ---------------- publish ------------------------------------------------ #
-    def publish(self, message: Dict[str, Any], queue: QueueName = QueueName.TASK) -> None:
-        body = json.dumps(message).encode()
+# --------------------------------------------------------------------- #
+# 4 ▪ Consumer                                                          #
+# --------------------------------------------------------------------- #
+class AsyncConsumer:
+    """Consome TASK, manda rejeições para DLQ.  
+    `callback` deve retornar *True* se a task foi processada com sucesso."""
 
-        while True:
-            try:
-                self._channel.basic_publish(
-                    exchange="",
-                    routing_key=queue.value,
-                    body=body,
-                    mandatory=True,
-                    properties=pika.BasicProperties(delivery_mode=2),
-                )
-
-                # aguarda confirmação do broker (ACK/NACK)
-                if getattr(self._channel, "_supports_wait", False):
-                    self._channel.wait_for_confirms()
-
-                logger.debug("Mensagem publicada em %s", queue.value)
-                return
-
-            except (pk_exc.UnroutableError, pk_exc.NackError):
-                logger.error("Mensagem NACK/Unroutable – descartada: %s", message)
-                return
-            except pk_exc.ChannelClosedByBroker as err:
-                logger.warning("Canal fechado (%s) – reabrindo…", err)
-                self._channel = self._conn.open_channel(confirms=True)
-            except pk_exc.AMQPError:
-                logger.exception("Erro ao publicar; reabrindo canal…")
-                self._channel = self._conn.open_channel(confirms=True)
-
-    def consume(self, *_, **__):
-        raise NotImplementedError("Publisher não consome mensagens.")
-
-
-# --------------------------------------------------------------------------- #
-# 5 ▪ Consumer (worker)                                                       #
-# --------------------------------------------------------------------------- #
-class ConsumerRabbitMQBroker(MessageBroker):
-    """Broker exclusivo do worker para consumir mensagens."""
-
-    def __init__(self, conn: _Connection | None = None, prefetch_count: int = 1):
-        self._conn = conn or _Connection(settings.rabbitmq_url)
-        self._channel = self._conn.open_channel()
-        self._channel.queue_declare(queue=QueueName.TASK.value, durable=True)
-        self._channel.basic_qos(prefetch_count=prefetch_count)
-
-    # ---------------- republish -------------------------------------------- #
-    def publish(self, message: Dict[str, Any], queue: QueueName = QueueName.TASK) -> None:
-        # usa canal *exclusivo* de publisher para não interferir no consumer
-        PublisherRabbitMQBroker(self._conn).publish(message, queue)
-
-    # ---------------- consume ---------------------------------------------- #
-    def consume(
+    def __init__(
         self,
-        callback: Callable[[Dict[str, Any]], bool],
+        conn: _AsyncConnection | None = None,
+        prefetch: int = 1,
+    ):
+        self._conn = conn or _AsyncConnection(settings.rabbitmq_url)
+        self._prefetch = prefetch
+
+    async def consume(
+        self,
+        callback: Callable[[Dict[str, Any]], Awaitable[bool]],
         queue: QueueName = QueueName.TASK,
     ) -> None:
-        def _on_msg(ch, method, _props, body: bytes):
-            try:
-                payload = json.loads(body)
-            except json.JSONDecodeError:
-                logger.exception("JSON inválido – reject")
-                ch.basic_reject(method.delivery_tag, requeue=False)
-                return
+        ch = await self._conn.new_consumer_channel(self._prefetch)
 
-            ok = False
-            try:
-                ok = callback(payload)  # True → ACK; False → DLQ
-            except Exception:
-                logger.exception("Erro inesperado no callback")
+        # declara fila (idempotente)
+        q = await ch.declare_queue(
+            queue.value,
+            durable=True,
+            arguments={"x-dead-letter-exchange": ""},
+        )
 
-            if ok:
-                ch.basic_ack(method.delivery_tag)
-            else:
-                logger.warning("Task falhou – DLQ")
-                ch.basic_reject(method.delivery_tag, requeue=False)
+        async with q.iterator() as it:
+            logger.info("Consumindo fila '%s' (async)…", queue.value)
 
-        self._channel.basic_consume(queue=queue.value, on_message_callback=_on_msg)
-        logger.info("Consumindo fila '%s'…", queue.value)
+            async for msg in it:                        # type: aio_pika.IncomingMessage
+                async with msg.process(requeue=False):  # ack automático se não lançar
+                    try:
+                        payload = json.loads(msg.body)
+                    except json.JSONDecodeError:
+                        logger.exception("JSON inválido – DLQ")
+                        await msg.reject(requeue=False)
+                        continue
 
-        try:
-            self._channel.start_consuming()
-        except KeyboardInterrupt:
-            logger.info("Consumer interrompido (Ctrl+C)")
-            self._channel.stop_consuming()
-        finally:
-            self._conn.close()
+                    try:
+                        ok = await callback(payload)
+                    except Exception:
+                        logger.exception("Erro inesperado no callback")
+                        ok = False
 
-
-# --------------------------------------------------------------------------- #
-# 6 ▪ Alias legado (mantido para não quebrar importações antigas)             #
-# --------------------------------------------------------------------------- #
-class RabbitMQBroker(PublisherRabbitMQBroker):
-    """Mantém retrocompatibilidade com `RabbitMQBroker`."""
-    ...
+                    if not ok:
+                        logger.warning("Task falhou – DLQ")
+                        await msg.reject(requeue=False)
+                    # se ok==True, o context manager já envia ACK

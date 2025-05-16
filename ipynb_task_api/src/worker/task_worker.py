@@ -1,14 +1,12 @@
+import asyncio
 import signal
-import threading
-import time
-from contextlib import contextmanager
-from typing import Dict
+from typing import Any, Dict
 
 from infrastructure.broker.rabbitmq import (
-    ConsumerRabbitMQBroker,
-    MessageBroker,
-    PublisherRabbitMQBroker,
+    AsyncConsumer,
+    AsyncPublisher,
     QueueName,
+    _AsyncConnection,
 )
 from infrastructure.persistence.sqlserver import (
     RequestRepository,
@@ -20,82 +18,73 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Soft-timeout util ----------------------------------------------------------
-# ---------------------------------------------------------------------------
 
+class TaskWorkerAsync:
+    """Worker que consome a fila **TASK** de forma assíncrona."""
 
-@contextmanager
-def soft_timeout(seconds: int):
-    """Levanta TimeoutError depois de *seconds* em Unix e Windows."""
-    if hasattr(signal, "SIGALRM"):  # Unix
-        def _handler(_sig, _frame):
-            raise TimeoutError("Tempo limite excedido")
-
-        signal.signal(signal.SIGALRM, _handler)
-        signal.alarm(seconds)
-        try:
-            yield
-        finally:
-            signal.alarm(0)
-    else:  # Windows
-        timer = threading.Timer(seconds, lambda: (_ for _ in ()).throw(TimeoutError()))
-        timer.start()
-        try:
-            yield
-        finally:
-            timer.cancel()
-
-
-# ---------------------------------------------------------------------------
-# Worker --------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-
-
-class TaskWorker:
     def __init__(
         self,
-        broker: MessageBroker | None = None,
+        conn: _AsyncConnection | None = None,
         repo: RequestRepository | None = None,
         runner: NotebookRunner | None = None,
         max_retries: int | None = None,
-    ):
-        self._broker = broker or ConsumerRabbitMQBroker()
-        self._publisher = PublisherRabbitMQBroker()
+        prefetch: int = 1,
+    ) -> None:
+        self._conn = conn or _AsyncConnection(settings.rabbitmq_url)
+        self._consumer = AsyncConsumer(self._conn, prefetch=prefetch)
+        self._publisher = AsyncPublisher(self._conn)
 
-        self._repo = repo or SqlServerRequestRepository()
-        self._runner = runner or NotebookRunner()
-        self._max_retries = 2 
+        self._repo: RequestRepository = repo or SqlServerRequestRepository()
+        self._runner: NotebookRunner = runner or NotebookRunner()
+        self._max_retries: int = max_retries or 2
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
+    # helpers
+    # ----------------------------------------------------------
 
-    def _process(self, msg: Dict) -> bool:
-        """Callback que processa a task.
-        Retorna True → ACK
-        Retorna False → NACK (requeue=True)
+    async def _run_notebook(self, *args, **kwargs):
+        """Executa `NotebookRunner.execute` em *thread pool*."""
+        return await asyncio.to_thread(self._runner.execute, *args, **kwargs)
+
+    async def _repo_call(self, fn, *args, **kwargs):
+        """Executa métodos do repositório no pool de *threads*."""
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    # ----------------------------------------------------------
+    # callback de consumo
+    # ----------------------------------------------------------
+
+    async def _process(self, msg: Dict[str, Any]) -> bool:
+        """Processa uma mensagem.
+
+        Retorna **True** → ACK
+        Retorna **False** → NACK (mas nunca requeue: DLQ)
         """
         req_id = msg["request_id"]
-        nb     = msg["notebook_name"]
-        ver    = msg.get("version")
+        nb = msg["notebook_name"]
+        ver = msg.get("version")
         params = msg.get("params", {})
 
         logger.debug("Processando request %s – %s", req_id, nb)
 
         try:
-            self._repo.mark_started(req_id)
-            with soft_timeout(settings.notebook_timeout + 30):
-                otype, opath = self._runner.execute(req_id, nb, ver, params)
+            await self._repo_call(self._repo.mark_started, req_id)
 
-            self._repo.mark_success(req_id, otype, str(opath))
+            timeout = settings.notebook_timeout + 30
+            otype, opath = await asyncio.wait_for(
+                self._run_notebook(req_id, nb, ver, params),
+                timeout=timeout,
+            )
+
+            await self._repo_call(self._repo.mark_success, req_id, otype, str(opath))
             logger.info("Request %s concluída com sucesso", req_id)
             return True
 
-        except (NotebookRunError, TimeoutError, Exception) as exc:  # noqa: BLE001
+        except (NotebookRunError, asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
             logger.error("Request %s falhou: %s", req_id, exc)
 
-            # ---------- RETRY / DLQ -----------------
-            self._repo.inc_retry(req_id)
-            retry = self._repo.current_retry(req_id)
+            await self._repo_call(self._repo.inc_retry, req_id)
+            retry = await self._repo_call(self._repo.current_retry, req_id)
 
             if retry <= self._max_retries:
                 backoff = 2 ** retry
@@ -105,37 +94,54 @@ class TaskWorker:
                     self._max_retries,
                     backoff,
                 )
-                time.sleep(backoff)
+                await asyncio.sleep(backoff)
                 msg["retry"] = retry
-                self._publisher.publish(msg)     # re-enfileira cópia modificada
-                return True                      # ACK → remove original
+                await self._publisher.publish(msg)
+                return True  # ACK → remove original
             else:
                 logger.error("Request %s excedeu max_retries → DLQ", req_id)
-                self._repo.mark_failure(req_id, str(exc))
-                self._publisher.publish(msg, queue=QueueName.DLQ)
-                return True                      # ACK → remove original
+                await self._repo_call(self._repo.mark_failure, req_id, str(exc))
+                await self._publisher.publish(msg, queue=QueueName.DLQ)
+                return True  # ACK → remove original
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
+    # ciclo de vida
+    # ----------------------------------------------------------
 
-    def start(self) -> None:
-        logger.info("Worker iniciado – Ctrl+C para sair")
+    async def start(self) -> None:
+        """Inicia o loop de consumo e lida com SIGINT/SIGTERM."""
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
 
-        def _graceful(_sig, _frame):
-            raise KeyboardInterrupt
+        def _graceful() -> None:
+            logger.info("Sinal recebido – encerrando…")
+            stop_event.set()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, _graceful)
+            try:
+                loop.add_signal_handler(sig, _graceful)
+            except NotImplementedError:  # Windows SIGTERM
+                signal.signal(sig, lambda *_: _graceful())
 
+        consumer_task = asyncio.create_task(self._consumer.consume(self._process))
+
+        await stop_event.wait()  # aguarda Ctrl+C ou kill
+        consumer_task.cancel()
         try:
-            self._broker.consume(self._process)
-        except KeyboardInterrupt:
-            logger.info("Worker encerrado")
+            await consumer_task
+        except asyncio.CancelledError:
+            pass
+
+        await self._conn.close()
+        logger.info("Worker encerrado")
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# CLI helper
+# -------------------------------------------------------------------------
 
 def main() -> None:
-    TaskWorker().start()
+    asyncio.run(TaskWorkerAsync().start())
 
 
 if __name__ == "__main__":
